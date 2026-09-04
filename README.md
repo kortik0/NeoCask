@@ -1,3 +1,5 @@
+[![Tests](https://github.com/kortik0/NeoCask/actions/workflows/tests.yml/badge.svg)](https://github.com/kortik0/NeoCask/actions/workflows/tests.yml)
+
 # NeoCask
 
 **NeoCask** is a from-scratch C# implementation of the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) storage model described by Riak.
