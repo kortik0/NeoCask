@@ -9,7 +9,7 @@ public interface IRaftNodeAddressProvider
     Uri GetAddress(string nodeId);
 }
 
-public class InvalidDataException(string message = $"Node returned empty response") : Exception();
+public class InvalidDataException(string message = $"Node returned empty response") : Exception(message);
 
 public class NeoCaskRaftTransporter(HttpClient httpClient, IRaftNodeAddressProvider nodeAddressProvider)
     : INeoCaskRaftTransporter

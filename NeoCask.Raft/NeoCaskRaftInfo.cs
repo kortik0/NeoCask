@@ -13,53 +13,53 @@ public class NeoCaskRaftInfo
     /// What this node currently believes itself to be.
     /// Changes over time. Always starts as Follower after restart.
     /// </summary>
-    public RaftRole Role { get; set; }
+    public RaftRole Role { get; set; } = RaftRole.Follower;
 
     /// <summary>
     /// Current term (epoch) this node lives in.
     /// Only increases, never decreases. Used to detect stale messages from old terms.
     /// </summary>
-    public ulong CurrentTerm { get; set; }
+    public ulong CurrentTerm { get; set; } = 0;
 
     /// <summary>
     /// Candidate this node voted for in CurrentTerm.
     /// Needed to vote at most once per term. Null if no vote yet in this term.
     /// </summary>
-    public string? VotedFor { get; set; }
+    public string VotedFor { get; set; } = string.Empty;
 
     /// <summary>
     /// Ordered shared log of commands.
     /// LogIndex of an entry is stable and is not the position in the List.
     /// </summary>
-    public List<LogEntry> LogEntries { get; set; }
+    public List<LogEntry> LogEntries { get; set; } = [];
 
     /// <summary>
     /// Highest log index known to be committed, i.e. stored on a majority of nodes.
     /// Committed does not mean applied to NeoCask yet. Only moves forward.
     /// </summary>
-    long CommitIndex;
+    public long CommitIndex { get; set; } = 0;
 
     /// <summary>
     /// Highest log index already applied to the local NeoCask.
     /// Always less than or equal to CommitIndex. Only moves forward.
     /// </summary>
-    long LastApplied;
+    public long LastApplied { get; set; } = 0;
 
     /// <summary>
     /// Who this node currently considers the leader.
     /// If this node is the leader, contains its own NodeId. Kept only in memory.
     /// </summary>
-    string? LeaderId;
+    public string? LeaderId { get; set; }
 
     /// <summary>
     /// Maintained only by the leader, empty on other nodes.
     /// For each follower, the index of the next log entry to send to that follower.
     /// </summary>
-    Dictionary<string, long> NextIndex;
+    public Dictionary<string, long> NextIndex { get; } = new();
 
     /// <summary>
     /// Maintained only by the leader, empty on other nodes.
     /// For each follower, the highest log index known to be replicated on that follower.
     /// </summary>
-    Dictionary<string, long> MatchIndex;
+    public Dictionary<string, long> MatchIndex { get; } = new();
 }
