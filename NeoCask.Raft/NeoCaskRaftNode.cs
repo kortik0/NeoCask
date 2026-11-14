@@ -12,6 +12,8 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
     private readonly IReadOnlyList<string> _peers;
     private readonly object _lock = new();
 
+    public NeoCaskRaftInfo Info => _raftInfo;
+
     private Timer? _heartbeatTimer;
     private Timer? _electionTimer;
 
@@ -32,7 +34,7 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
         lock (_lock)
         {
             _cancellationTokenSource = new CancellationTokenSource();
-            _electionTimer = new Timer()
+            // _electionTimer = new Timer()
         }
     }
 
@@ -99,6 +101,94 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
             _raftInfo.VotedFor = requestVoteReq.CandidateId;
             resp = new RequestVoteResp(_raftInfo.CurrentTerm, true);
             return resp;
+        }
+    }
+
+    public async Task StartElectionAsync(CancellationToken cancellationToken)
+    {
+        ulong startedTerm;
+        RequestVoteReq? voteRequest = null;
+
+        lock (_lock)
+        {
+            _raftInfo.Role = RaftRole.Candidate;
+            _raftInfo.CurrentTerm += 1;
+            startedTerm = _raftInfo.CurrentTerm;
+            _raftInfo.VotedFor = _raftInfo.NodeId;
+            _raftInfo.LeaderId = "";
+
+            var entry = _raftInfo.LogEntries.LastOrDefault();
+            voteRequest = new RequestVoteReq(_raftInfo.CurrentTerm, _raftInfo.NodeId, entry?.LogIndex ?? 0,
+                entry?.Term ?? 0);
+        }
+
+
+        var tasks = _peers.Select(async peer =>
+        {
+            try
+            {
+                return await _transporter.RequestVoteAsync(peer, voteRequest, cancellationToken);
+            }
+            catch (Exception e)
+            {
+                return null;
+            }
+        });
+
+        var voteResponse = await Task.WhenAll(tasks);
+
+        lock (_lock)
+        {
+            var isTermChanged = startedTerm != _raftInfo.CurrentTerm;
+            var isNotMoreCandidate = _raftInfo.Role != RaftRole.Candidate;
+
+            if (isTermChanged || isNotMoreCandidate)
+            {
+                return;
+            }
+
+            var grantedVotes = 0;
+            foreach (var vote in voteResponse)
+            {
+                if (vote is null)
+                {
+                    continue;
+                }
+
+                if (vote.Term > _raftInfo.CurrentTerm)
+                {
+                    _raftInfo.Role = RaftRole.Follower;
+                    _raftInfo.CurrentTerm = vote.Term;
+                    _raftInfo.VotedFor = string.Empty;
+                    _raftInfo.LeaderId = string.Empty;
+                    return;
+                }
+
+                if (vote.IsVoted)
+                {
+                    grantedVotes += 1;
+                }
+            }
+
+            //Vote for self
+            grantedVotes += 1;
+
+            var isMajorityVoteGrant = grantedVotes > (_peers.Count + 1) / 2;
+            if (isMajorityVoteGrant)
+            {
+                _raftInfo.Role = RaftRole.Leader;
+                _raftInfo.VotedFor = _raftInfo.NodeId;
+
+                var lastLogEntry = _raftInfo.LogEntries.LastOrDefault()?.LogIndex ?? 0;
+
+                foreach (var peer in _peers)
+                {
+                    _raftInfo.NextIndex[peer] = lastLogEntry + 1;
+                    _raftInfo.MatchIndex[peer] = 0;
+                }
+
+                _raftInfo.LeaderId = _raftInfo.NodeId;
+            }
         }
     }
 

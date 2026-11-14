@@ -41,7 +41,10 @@
   &lt;Solution /&gt;&#xD;
 &lt;/SessionState&gt;</s:String>
 	<s:String x:Key="/Default/Environment/UnitTesting/UnitTestSessionStore/Sessions/=83a6d865_002De496_002D4ce0_002D85c6_002Db12f29bcff5b/@EntryIndexedValue">&lt;SessionState ContinuousTestingMode="0" IsActive="True" Name="All tests from &amp;lt;NeoCask.Tests&amp;gt;" xmlns="urn:schemas-jetbrains-com:jetbrains-ut-session"&gt;&#xD;
-  &lt;ProjectFile&gt;7AFD32E0-95EF-4C05-A178-82BA45D56D0E/f:NeoCaskTests.cs&lt;/ProjectFile&gt;&#xD;
+  &lt;Or&gt;&#xD;
+    &lt;ProjectFile&gt;7AFD32E0-95EF-4C05-A178-82BA45D56D0E/f:NeoCaskTests.cs&lt;/ProjectFile&gt;&#xD;
+    &lt;ProjectFile&gt;84E7FE97-BC3D-4B6F-9841-07A551385D74/f:StubTransporter.cs&lt;/ProjectFile&gt;&#xD;
+  &lt;/Or&gt;&#xD;
 &lt;/SessionState&gt;</s:String>
 	
 	

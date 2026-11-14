@@ -49,7 +49,7 @@ public class NeoCaskRaftInfo
     /// Who this node currently considers the leader.
     /// If this node is the leader, contains its own NodeId. Kept only in memory.
     /// </summary>
-    public string? LeaderId { get; set; }
+    public string LeaderId { get; set; } = string.Empty;
 
     /// <summary>
     /// Maintained only by the leader, empty on other nodes.
