@@ -104,6 +104,64 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
         }
     }
 
+    public AppendEntriesResp HandleAppendEntries(AppendEntriesReq req)
+    {
+        lock (_lock)
+        {
+            if (req.Term < _raftInfo.CurrentTerm)
+            {
+                return new AppendEntriesResp(_raftInfo.CurrentTerm, false);
+            }
+
+            if (req.Term > _raftInfo.CurrentTerm)
+            {
+                _raftInfo.CurrentTerm = req.Term;
+                _raftInfo.Role = RaftRole.Follower;
+
+                _raftInfo.VotedFor = string.Empty;
+            }
+
+            if (req.Term == _raftInfo.CurrentTerm && _raftInfo.Role != RaftRole.Follower)
+            {
+                _raftInfo.Role = RaftRole.Follower;
+            }
+
+            _raftInfo.LeaderId = req.LeaderId;
+
+            var logEntry = _raftInfo.LogEntries.Find(log => log.LogIndex == req.PrevLogIndex);
+
+            if ((req.PrevLogIndex > 0 && logEntry is null) ||
+                (logEntry is not null && req.PrevLogTerm != logEntry.Term))
+            {
+                return new AppendEntriesResp(_raftInfo.CurrentTerm, false);
+            }
+
+            foreach (var entry in req.Entries)
+            {
+                var prevEntry = _raftInfo.LogEntries.FindIndex(log => log.LogIndex == entry.LogIndex);
+                if (prevEntry == -1)
+                {
+                    _raftInfo.LogEntries.Add(entry);
+                    continue;
+                }
+
+                if (entry.Term == _raftInfo.LogEntries[prevEntry].Term) continue;
+
+                var countToEndOfList = _raftInfo.LogEntries.Count - prevEntry;
+                _raftInfo.LogEntries.RemoveRange(prevEntry, countToEndOfList);
+                _raftInfo.LogEntries.Add(entry);
+            }
+
+            var lastNewIndex = req.PrevLogIndex + req.Entries.Count;
+            if (req.LeaderCommit > _raftInfo.CommitIndex)
+            {
+                _raftInfo.CommitIndex = Math.Min(req.LeaderCommit, lastNewIndex);
+            }
+
+            return new AppendEntriesResp(_raftInfo.CurrentTerm, true);
+        }
+    }
+
     public async Task StartElectionAsync(CancellationToken cancellationToken)
     {
         ulong startedTerm;

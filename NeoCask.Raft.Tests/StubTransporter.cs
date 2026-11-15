@@ -365,3 +365,303 @@ public class StartElectionTests
         Assert.Equal(RaftRole.Candidate, node1.Info.Role);
     }
 }
+
+public class HandleAppendEntriesTests
+{
+    private static NeoCaskRaftNode NewNode() => CreateNode("node1", ["node2", "node3"], new StubTransporter());
+
+    private static NeoCaskRaftNode NewNodeWithLog(params LogEntry[] log)
+    {
+        var node = NewNode();
+        node.Info.LogEntries.AddRange(log);
+        return node;
+    }
+
+    /// Запрос от node2 с записями. LeaderCommit по умолчанию 0, меняется через `with`.
+    private static AppendEntriesReq Append(ulong term, long prevIndex, ulong prevTerm, params LogEntry[] entries)
+        => new(term, "node2", prevIndex, prevTerm, entries.ToList(), 0);
+
+    // ---------- Терм и роли ----------
+
+    [Fact]
+    public void StaleTerm_IsRejected_AndStateUnchanged()
+    {
+        var node = NewNode();
+        node.Info.CurrentTerm = 2;
+
+        var resp = node.HandleAppendEntries(Append(1, 0, 0));
+
+        Assert.False(resp.Success);
+        Assert.Equal(2UL, resp.Term);
+        Assert.Equal(2UL, node.Info.CurrentTerm);
+        Assert.Equal("", node.Info.LeaderId);
+    }
+
+    [Fact]
+    public void Heartbeat_OnEmptyLog_Succeeds_AndSetsLeader()
+    {
+        var node = NewNode();
+
+        var resp = node.HandleAppendEntries(Append(1, 0, 0));
+
+        Assert.True(resp.Success);
+        Assert.Equal(1UL, resp.Term);
+        Assert.Equal(1UL, node.Info.CurrentTerm);
+        Assert.Equal("node2", node.Info.LeaderId);
+    }
+
+    [Fact]
+    public void HigherTerm_AdoptsTerm_ResetsVote_BecomesFollower()
+    {
+        var node = NewNode();
+        node.HandleRequestVote(Vote(1, "node3"));
+        node.Info.Role = RaftRole.Candidate;
+
+        node.HandleAppendEntries(Append(3, 0, 0));
+
+        Assert.Equal(3UL, node.Info.CurrentTerm);
+        Assert.Equal("", node.Info.VotedFor);
+        Assert.Equal(RaftRole.Follower, node.Info.Role);
+        Assert.Equal("node2", node.Info.LeaderId);
+    }
+
+    [Fact]
+    public void HigherTerm_DemotesLeaderToFollower()
+    {
+        var node = NewNode();
+        node.Info.CurrentTerm = 1;
+        node.Info.Role = RaftRole.Leader;
+        node.Info.LeaderId = "node1";
+
+        node.HandleAppendEntries(Append(2, 0, 0));
+
+        Assert.Equal(RaftRole.Follower, node.Info.Role);
+        Assert.Equal("node2", node.Info.LeaderId);
+    }
+
+    [Fact]
+    public void SameTerm_Candidate_BecomesFollower_KeepsOwnVote()
+    {
+        var node = NewNode();
+        node.Info.CurrentTerm = 1;
+        node.Info.Role = RaftRole.Candidate;
+        node.Info.VotedFor = "node1";
+
+        node.HandleAppendEntries(Append(1, 0, 0));
+
+        Assert.Equal(RaftRole.Follower, node.Info.Role);
+        Assert.Equal("node1", node.Info.VotedFor); // в этом терме мы уже проголосовали, голос не сбрасывается
+        Assert.Equal("node2", node.Info.LeaderId);
+    }
+
+    // ---------- Проверка PrevLogIndex / PrevLogTerm ----------
+
+    [Fact]
+    public void PrevLogIndex_BeyondOurLog_IsRejected()
+    {
+        var node = NewNodeWithLog(Entry(1, 1));
+
+        var resp = node.HandleAppendEntries(Append(1, 3, 1, Entry(4, 1)));
+
+        Assert.False(resp.Success);
+        Assert.Single(node.Info.LogEntries);
+    }
+
+    [Fact]
+    public void PrevLogIndex_OnEmptyLog_IsRejected()
+    {
+        var node = NewNode();
+
+        var resp = node.HandleAppendEntries(Append(1, 1, 1, Entry(2, 1)));
+
+        Assert.False(resp.Success);
+        Assert.Empty(node.Info.LogEntries);
+    }
+
+    [Fact]
+    public void PrevLogTerm_Mismatch_IsRejected()
+    {
+        var node = NewNodeWithLog(Entry(1, 1), Entry(2, 1));
+
+        var resp = node.HandleAppendEntries(Append(2, 2, 2, Entry(3, 2)));
+
+        Assert.False(resp.Success);
+        Assert.Equal(2, node.Info.LogEntries.Count);
+    }
+
+    [Fact]
+    public void PrevLog_Matches_Succeeds()
+    {
+        var node = NewNodeWithLog(Entry(1, 1));
+
+        var resp = node.HandleAppendEntries(Append(1, 1, 1));
+
+        Assert.True(resp.Success);
+    }
+
+    [Fact]
+    public void RejectedByLogMismatch_StillAdoptsTermAndLeader()
+    {
+        // Лидер терма легитимен, даже если журналы пока не совпали
+        var node = NewNodeWithLog(Entry(1, 1));
+
+        var resp = node.HandleAppendEntries(Append(2, 3, 1));
+
+        Assert.False(resp.Success);
+        Assert.Equal(2UL, resp.Term);
+        Assert.Equal(2UL, node.Info.CurrentTerm);
+        Assert.Equal("node2", node.Info.LeaderId);
+    }
+
+    // ---------- Дописывание записей (Часть 3) ----------
+
+    [Fact]
+    public void NewEntries_AreAppendedToEmptyLog()
+    {
+        var node = NewNode();
+
+        var resp = node.HandleAppendEntries(Append(1, 0, 0, Entry(1, 1), Entry(2, 1)));
+
+        Assert.True(resp.Success);
+        Assert.Equal([1L, 2L], node.Info.LogEntries.Select(e => e.LogIndex));
+    }
+
+    [Fact]
+    public void NewEntries_AreAppendedAfterExisting()
+    {
+        var node = NewNodeWithLog(Entry(1, 1));
+
+        var resp = node.HandleAppendEntries(Append(1, 1, 1, Entry(2, 1), Entry(3, 1)));
+
+        Assert.True(resp.Success);
+        Assert.Equal([1L, 2L, 3L], node.Info.LogEntries.Select(e => e.LogIndex));
+    }
+
+    [Fact]
+    public void SameRequestTwice_DoesNotDuplicateEntries()
+    {
+        var node = NewNode();
+        var req = Append(1, 0, 0, Entry(1, 1), Entry(2, 1));
+
+        node.HandleAppendEntries(req);
+        var resp = node.HandleAppendEntries(req);
+
+        Assert.True(resp.Success);
+        Assert.Equal([1L, 2L], node.Info.LogEntries.Select(e => e.LogIndex));
+    }
+
+    [Fact]
+    public void PartiallyOverlappingRequest_AppendsOnlyMissingEntries()
+    {
+        var node = NewNodeWithLog(Entry(1, 1), Entry(2, 1));
+
+        var resp = node.HandleAppendEntries(Append(1, 0, 0, Entry(1, 1), Entry(2, 1), Entry(3, 1)));
+
+        Assert.True(resp.Success);
+        Assert.Equal([1L, 2L, 3L], node.Info.LogEntries.Select(e => e.LogIndex));
+    }
+
+    [Fact]
+    public void ConflictingSuffix_IsTruncatedAndReplaced()
+    {
+        // 2, 3 и 4 записаны старым лидером в терме 1, новый лидер (терм 2) перезаписывает с индекса 2
+        var node = NewNodeWithLog(Entry(1, 1), Entry(2, 1), Entry(3, 1), Entry(4, 1));
+
+        var resp = node.HandleAppendEntries(Append(2, 1, 1, Entry(2, 2)));
+
+        Assert.True(resp.Success);
+        Assert.Equal([1L, 2L], node.Info.LogEntries.Select(e => e.LogIndex));
+        Assert.Equal([1UL, 2UL], node.Info.LogEntries.Select(e => e.Term));
+    }
+
+    [Fact]
+    public void ConflictInTheMiddleOfBatch_KeepsMatchingPrefix()
+    {
+        var node = NewNodeWithLog(Entry(1, 1), Entry(2, 1), Entry(3, 1));
+
+        var resp = node.HandleAppendEntries(Append(2, 1, 1, Entry(2, 1), Entry(3, 2)));
+
+        Assert.True(resp.Success);
+        Assert.Equal([1UL, 1UL, 2UL], node.Info.LogEntries.Select(e => e.Term));
+    }
+
+    // Ловушка 1: запоздалые запросы не должны стирать хорошие записи
+
+    [Fact]
+    public void StaleDuplicateRequest_DoesNotTruncateLog()
+    {
+        var node = NewNodeWithLog(Entry(1, 1), Entry(2, 1), Entry(3, 1));
+
+        var resp = node.HandleAppendEntries(Append(1, 1, 1, Entry(2, 1)));
+
+        Assert.True(resp.Success);
+        Assert.Equal(3, node.Info.LogEntries.Count);
+    }
+
+    [Fact]
+    public void Heartbeat_DoesNotTruncateLog()
+    {
+        var node = NewNodeWithLog(Entry(1, 1), Entry(2, 1), Entry(3, 1));
+
+        var resp = node.HandleAppendEntries(Append(1, 1, 1));
+
+        Assert.True(resp.Success);
+        Assert.Equal(3, node.Info.LogEntries.Count);
+    }
+
+    // ---------- CommitIndex (Часть 3) ----------
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(2, 2)] // лидер закоммитил меньше, чем мы получили
+    [InlineData(3, 3)]
+    [InlineData(10, 3)] // лидер закоммитил больше, но мы знаем только до 3
+    public void CommitIndex_IsLimitedByLastEntryFromRequest(long leaderCommit, long expected)
+    {
+        var node = NewNode();
+        var req = Append(1, 0, 0, Entry(1, 1), Entry(2, 1), Entry(3, 1)) with { LeaderCommit = leaderCommit };
+
+        node.HandleAppendEntries(req);
+
+        Assert.Equal(expected, node.Info.CommitIndex);
+    }
+
+    // Ловушка 2: нельзя коммитить хвост, который лидер не проверял
+
+    [Fact]
+    public void Heartbeat_DoesNotCommitUnverifiedTail()
+    {
+        // у нас 1-5, лидер подтвердил совпадение только до 2
+        var node = NewNodeWithLog(Entry(1, 1), Entry(2, 1), Entry(3, 1), Entry(4, 1), Entry(5, 1));
+        var req = Append(1, 2, 1) with { LeaderCommit = 5 };
+
+        node.HandleAppendEntries(req);
+
+        Assert.Equal(2L, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void CommitIndex_NeverDecreases()
+    {
+        var node = NewNodeWithLog(Entry(1, 1), Entry(2, 1), Entry(3, 1));
+        node.Info.CommitIndex = 3;
+        var req = Append(1, 3, 1) with { LeaderCommit = 1 };
+
+        node.HandleAppendEntries(req);
+
+        Assert.Equal(3L, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void RejectedRequest_DoesNotChangeLogOrCommitIndex()
+    {
+        var node = NewNodeWithLog(Entry(1, 1));
+        var req = Append(1, 3, 1, Entry(4, 1)) with { LeaderCommit = 5 };
+
+        var resp = node.HandleAppendEntries(req);
+
+        Assert.False(resp.Success);
+        Assert.Equal(0L, node.Info.CommitIndex);
+        Assert.Single(node.Info.LogEntries);
+    }
+}
