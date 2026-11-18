@@ -217,19 +217,22 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
                 return;
             }
 
-            if (!entriesResp.Success)
+            switch (entriesResp.Success)
             {
-                var currentIndex = _raftInfo.NextIndex[peer];
-                var nextIndex = Math.Max(1, currentIndex - 1);
-                _raftInfo.NextIndex[peer] = nextIndex;
-                return;
-            }
-
-            if (entriesResp.Success)
-            {
-                var entriesCount = prevLogIndex + req.Entries.Count;
-                _raftInfo.MatchIndex[peer] = entriesCount;
-                _raftInfo.NextIndex[peer] = entriesCount + 1;
+                case false:
+                {
+                    var currentIndex = _raftInfo.NextIndex[peer];
+                    var nextIndex = Math.Max(1, currentIndex - 1);
+                    _raftInfo.NextIndex[peer] = nextIndex;
+                    return;
+                }
+                case true:
+                {
+                    var entriesCount = prevLogIndex + req.Entries.Count;
+                    _raftInfo.MatchIndex[peer] = entriesCount;
+                    _raftInfo.NextIndex[peer] = entriesCount + 1;
+                    break;
+                }
             }
         }
     }
