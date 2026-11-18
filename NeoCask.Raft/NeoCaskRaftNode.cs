@@ -162,6 +162,78 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
         }
     }
 
+    public async Task ReplicateToPeerAsync(string peer, CancellationToken cancellationToken)
+    {
+        long prevLogIndex;
+        AppendEntriesReq req;
+
+        ulong startedTerm;
+        lock (_lock)
+        {
+            startedTerm = _raftInfo.CurrentTerm;
+
+            if (_raftInfo.Role != RaftRole.Leader)
+            {
+                return;
+            }
+
+            var nextIndex = _raftInfo.NextIndex[peer];
+            prevLogIndex = nextIndex - 1;
+            var prevLogTerm = (prevLogIndex > 0 && prevLogIndex <= _raftInfo.LogEntries.Count)
+                ? _raftInfo.LogEntries[(int)prevLogIndex - 1].Term
+                : 0;
+
+            var start = (int)nextIndex - 1;
+            var entries = _raftInfo.LogEntries.Slice(start, _raftInfo.LogEntries.Count - start);
+
+            req = new AppendEntriesReq(startedTerm, _raftInfo.NodeId, prevLogIndex, prevLogTerm, entries,
+                _raftInfo.CommitIndex);
+        }
+
+        AppendEntriesResp entriesResp;
+        try
+        {
+            entriesResp = await _transporter.AppendEntriesAsync(peer, req, cancellationToken);
+        }
+        catch
+        {
+            return;
+        }
+
+        lock (_lock)
+        {
+            if (_raftInfo.CurrentTerm != startedTerm ||
+                _raftInfo.Role != RaftRole.Leader)
+            {
+                return;
+            }
+
+            if (entriesResp.Term > _raftInfo.CurrentTerm)
+            {
+                _raftInfo.CurrentTerm = entriesResp.Term;
+                _raftInfo.VotedFor = string.Empty;
+                _raftInfo.Role = RaftRole.Follower;
+                _raftInfo.LeaderId = string.Empty;
+                return;
+            }
+
+            if (!entriesResp.Success)
+            {
+                var currentIndex = _raftInfo.NextIndex[peer];
+                var nextIndex = Math.Max(1, currentIndex - 1);
+                _raftInfo.NextIndex[peer] = nextIndex;
+                return;
+            }
+
+            if (entriesResp.Success)
+            {
+                var entriesCount = prevLogIndex + req.Entries.Count;
+                _raftInfo.MatchIndex[peer] = entriesCount;
+                _raftInfo.NextIndex[peer] = entriesCount + 1;
+            }
+        }
+    }
+
     public async Task StartElectionAsync(CancellationToken cancellationToken)
     {
         ulong startedTerm;

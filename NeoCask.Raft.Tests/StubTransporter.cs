@@ -21,9 +21,17 @@ public class StubTransporter : INeoCaskRaftTransporter
         return OnRequestVote(targetNodeId, requestVoteReq, cancellationToken);
     }
 
+    public Func<string, AppendEntriesReq, CancellationToken, Task<AppendEntriesResp>> OnAppendEntries { get; set; }
+        = (_, _, _) => throw new InvalidOperationException("OnAppendEntries is not configured");
+
+    public ConcurrentBag<(string Target, AppendEntriesReq Request)> SentAppends { get; } = [];
+
     public Task<AppendEntriesResp> AppendEntriesAsync(string targetNodeId, AppendEntriesReq appendEntriesReq,
         CancellationToken cancellationToken)
-        => throw new NotImplementedException();
+    {
+        SentAppends.Add((targetNodeId, appendEntriesReq));
+        return OnAppendEntries(targetNodeId, appendEntriesReq, cancellationToken);
+    }
 
     /// Запрос доходит до реального узла напрямую. Узлы из `down` не отвечают (исключение = "не дошло").
     public static Func<string, RequestVoteReq, CancellationToken, Task<RequestVoteResp>> Route(
@@ -663,5 +671,359 @@ public class HandleAppendEntriesTests
         Assert.False(resp.Success);
         Assert.Equal(0L, node.Info.CommitIndex);
         Assert.Single(node.Info.LogEntries);
+    }
+}
+
+public class ReplicateToPeerTests
+{
+    private const string Peer = "node2";
+
+    /// Лидер node1 в терме `term`. NextIndex пиров = последний индекс + 1, MatchIndex = 0.
+    private static NeoCaskRaftNode LeaderNode(StubTransporter transport, ulong term, params LogEntry[] log)
+    {
+        var node = CreateNode("node1", ["node2", "node3"], transport);
+        node.Info.CurrentTerm = term;
+        node.Info.Role = RaftRole.Leader;
+        node.Info.LeaderId = "node1";
+        node.Info.LogEntries.AddRange(log);
+
+        var next = (log.LastOrDefault()?.LogIndex ?? 0) + 1;
+        foreach (var peer in new[] { "node2", "node3" })
+        {
+            node.Info.NextIndex[peer] = next;
+            node.Info.MatchIndex[peer] = 0;
+        }
+
+        return node;
+    }
+
+    private static StubTransporter Responding(Func<AppendEntriesReq, AppendEntriesResp> respond)
+        => new() { OnAppendEntries = (_, req, _) => Task.FromResult(respond(req)) };
+
+    private static StubTransporter AlwaysSuccess()
+        => Responding(req => new AppendEntriesResp(req.Term, true));
+
+    private static StubTransporter AlwaysReject()
+        => Responding(req => new AppendEntriesResp(req.Term, false));
+
+    // ---------- Сборка запроса ----------
+
+    [Fact]
+    public async Task NotLeader_SendsNothing()
+    {
+        var transport = AlwaysSuccess();
+        var node = LeaderNode(transport, 1);
+        node.Info.Role = RaftRole.Follower;
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Empty(transport.SentAppends);
+    }
+
+    [Fact]
+    public async Task EmptyLog_SendsHeartbeatWithZeroPrev()
+    {
+        var transport = AlwaysSuccess();
+        var node = LeaderNode(transport, 3);
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        var (target, req) = Assert.Single(transport.SentAppends);
+        Assert.Equal(Peer, target);
+        Assert.Equal(3UL, req.Term);
+        Assert.Equal("node1", req.LeaderId);
+        Assert.Equal(0L, req.PrevLogIndex);
+        Assert.Equal(0UL, req.PrevLogTerm);
+        Assert.Empty(req.Entries);
+    }
+
+    [Fact]
+    public async Task NextIndexInMiddle_SendsPrevAndTailEntries()
+    {
+        var transport = AlwaysSuccess();
+        var node = LeaderNode(transport, 2,
+            Entry(1, 1), Entry(2, 1), Entry(3, 2), Entry(4, 2), Entry(5, 2));
+        node.Info.NextIndex[Peer] = 4;
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        var req = Assert.Single(transport.SentAppends).Request;
+        Assert.Equal(3L, req.PrevLogIndex);
+        Assert.Equal(2UL, req.PrevLogTerm); // терм записи 3
+        Assert.Equal([4L, 5L], req.Entries.Select(e => e.LogIndex));
+    }
+
+    [Fact]
+    public async Task NextIndexAtLogEnd_SendsHeartbeatWithLastEntryAsPrev()
+    {
+        var transport = AlwaysSuccess();
+        var node = LeaderNode(transport, 2, Entry(1, 1), Entry(2, 2)); // NextIndex = 3
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        var req = Assert.Single(transport.SentAppends).Request;
+        Assert.Equal(2L, req.PrevLogIndex);
+        Assert.Equal(2UL, req.PrevLogTerm);
+        Assert.Empty(req.Entries);
+    }
+
+    [Fact]
+    public async Task NextIndexOne_SendsWholeLogWithZeroPrev()
+    {
+        var transport = AlwaysSuccess();
+        var node = LeaderNode(transport, 1, Entry(1, 1), Entry(2, 1));
+        node.Info.NextIndex[Peer] = 1;
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        var req = Assert.Single(transport.SentAppends).Request;
+        Assert.Equal(0L, req.PrevLogIndex);
+        Assert.Equal(0UL, req.PrevLogTerm);
+        Assert.Equal([1L, 2L], req.Entries.Select(e => e.LogIndex));
+    }
+
+    [Fact]
+    public async Task SendsLeaderCommit()
+    {
+        var transport = AlwaysSuccess();
+        var node = LeaderNode(transport, 1, Entry(1, 1), Entry(2, 1));
+        node.Info.CommitIndex = 2;
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(2L, Assert.Single(transport.SentAppends).Request.LeaderCommit);
+    }
+
+    [Fact]
+    public async Task SendsOnlyToRequestedPeer()
+    {
+        var transport = AlwaysSuccess();
+        var node = LeaderNode(transport, 1, Entry(1, 1));
+
+        await node.ReplicateToPeerAsync("node3", CancellationToken.None);
+
+        Assert.Equal("node3", Assert.Single(transport.SentAppends).Target);
+    }
+
+    // ---------- Разбор ответа ----------
+
+    [Fact]
+    public async Task Success_WithEntries_UpdatesMatchAndNext()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 1,
+            Entry(1, 1), Entry(2, 1), Entry(3, 1), Entry(4, 1), Entry(5, 1));
+        node.Info.NextIndex[Peer] = 4; // Prev = 3, Entries = [4, 5]
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(5L, node.Info.MatchIndex[Peer]);
+        Assert.Equal(6L, node.Info.NextIndex[Peer]);
+    }
+
+    [Fact]
+    public async Task Success_OnHeartbeat_MatchEqualsPrevLogIndex()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 1, Entry(1, 1), Entry(2, 1), Entry(3, 1)); // NextIndex = 4
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(3L, node.Info.MatchIndex[Peer]);
+        Assert.Equal(4L, node.Info.NextIndex[Peer]);
+    }
+
+    [Fact]
+    public async Task Success_OnEmptyLog_KeepsZeroAndOne()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 1);
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(0L, node.Info.MatchIndex[Peer]);
+        Assert.Equal(1L, node.Info.NextIndex[Peer]);
+    }
+
+    [Fact]
+    public async Task Success_UpdatesOnlyThatPeer()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 1, Entry(1, 1), Entry(2, 1));
+        node.Info.NextIndex[Peer] = 1;
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(2L, node.Info.MatchIndex[Peer]);
+        Assert.Equal(0L, node.Info.MatchIndex["node3"]);
+        Assert.Equal(3L, node.Info.NextIndex["node3"]);
+    }
+
+    [Fact]
+    public async Task Reject_DecrementsNextIndex_KeepsMatchIndex()
+    {
+        var node = LeaderNode(AlwaysReject(), 1, Entry(1, 1), Entry(2, 1), Entry(3, 1), Entry(4, 1), Entry(5, 1));
+        node.Info.MatchIndex[Peer] = 2;
+        // NextIndex = 6
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(5L, node.Info.NextIndex[Peer]);
+        Assert.Equal(2L, node.Info.MatchIndex[Peer]);
+        Assert.Equal(RaftRole.Leader, node.Info.Role);
+    }
+
+    [Fact]
+    public async Task Reject_NextIndexNeverDropsBelowOne()
+    {
+        var node = LeaderNode(AlwaysReject(), 1, Entry(1, 1));
+        node.Info.NextIndex[Peer] = 1;
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(1L, node.Info.NextIndex[Peer]);
+    }
+
+    [Fact]
+    public async Task HigherTermInResponse_LeaderStepsDown()
+    {
+        var transport = Responding(_ => new AppendEntriesResp(7, false));
+        var node = LeaderNode(transport, 2, Entry(1, 1), Entry(2, 1));
+        node.Info.VotedFor = "node1";
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(RaftRole.Follower, node.Info.Role);
+        Assert.Equal(7UL, node.Info.CurrentTerm);
+        Assert.Equal("", node.Info.VotedFor);
+        Assert.Equal("", node.Info.LeaderId);
+    }
+
+    [Fact]
+    public async Task HigherTermInResponse_DoesNotTouchNextAndMatch()
+    {
+        var transport = Responding(_ => new AppendEntriesResp(7, false));
+        var node = LeaderNode(transport, 2, Entry(1, 1), Entry(2, 1)); // NextIndex = 3
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(3L, node.Info.NextIndex[Peer]);
+        Assert.Equal(0L, node.Info.MatchIndex[Peer]);
+    }
+
+    [Fact]
+    public async Task PeerUnreachable_DoesNotThrow_AndStateUnchanged()
+    {
+        var transport = new StubTransporter
+        {
+            OnAppendEntries = (_, _, _) =>
+                Task.FromException<AppendEntriesResp>(new HttpRequestException("down"))
+        };
+        var node = LeaderNode(transport, 2, Entry(1, 1), Entry(2, 1));
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(RaftRole.Leader, node.Info.Role);
+        Assert.Equal(2UL, node.Info.CurrentTerm);
+        Assert.Equal(3L, node.Info.NextIndex[Peer]);
+        Assert.Equal(0L, node.Info.MatchIndex[Peer]);
+    }
+
+    // ---------- Конкурентность: ответ пришёл, когда мир уже изменился ----------
+
+    [Fact]
+    public async Task Success_UsesRequestSnapshot_NotLeaderLogAtResponseTime()
+    {
+        // Пока ждали ответ, клиент добавил лидеру записи 3 и 4. Пир подтвердил только до 2.
+        var pending = new TaskCompletionSource<AppendEntriesResp>();
+        var transport = new StubTransporter { OnAppendEntries = (_, _, _) => pending.Task };
+        var node = LeaderNode(transport, 1, Entry(1, 1), Entry(2, 1));
+
+        var replication = node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+        Assert.False(replication.IsCompleted);
+
+        node.Info.LogEntries.AddRange([Entry(3, 1), Entry(4, 1)]);
+        pending.SetResult(new AppendEntriesResp(1, true));
+        await replication;
+
+        Assert.Equal(2L, node.Info.MatchIndex[Peer]);
+        Assert.Equal(3L, node.Info.NextIndex[Peer]);
+    }
+
+    [Fact]
+    public async Task LateSuccess_AfterTermMovedOn_IsIgnored()
+    {
+        var pending = new TaskCompletionSource<AppendEntriesResp>();
+        var transport = new StubTransporter { OnAppendEntries = (_, _, _) => pending.Task };
+        var node = LeaderNode(transport, 1, Entry(1, 1), Entry(2, 1)); // NextIndex = 3
+
+        var replication = node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+        Assert.False(replication.IsCompleted);
+
+        node.HandleRequestVote(Vote(5, "node3", lastIndex: 2, lastTerm: 1)); // лидер уступил
+        pending.SetResult(new AppendEntriesResp(1, true));
+        await replication;
+
+        Assert.Equal(RaftRole.Follower, node.Info.Role);
+        Assert.Equal(5UL, node.Info.CurrentTerm);
+        Assert.Equal(0L, node.Info.MatchIndex[Peer]);
+        Assert.Equal(3L, node.Info.NextIndex[Peer]);
+    }
+
+    [Fact]
+    public async Task LateReject_AfterTermMovedOn_IsIgnored()
+    {
+        var pending = new TaskCompletionSource<AppendEntriesResp>();
+        var transport = new StubTransporter { OnAppendEntries = (_, _, _) => pending.Task };
+        var node = LeaderNode(transport, 1, Entry(1, 1), Entry(2, 1)); // NextIndex = 3
+
+        var replication = node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+        Assert.False(replication.IsCompleted);
+
+        node.HandleRequestVote(Vote(5, "node3", lastIndex: 2, lastTerm: 1));
+        pending.SetResult(new AppendEntriesResp(1, false));
+        await replication;
+
+        Assert.Equal(3L, node.Info.NextIndex[Peer]); // не уменьшился
+    }
+
+    // ---------- Лидер и реальный фолловер вместе ----------
+
+    [Fact]
+    public async Task LaggingFollower_IsCaughtUp_AfterSeveralRounds()
+    {
+        var follower = CreateNode("node2", ["node1", "node3"], new StubTransporter());
+        var transport = new StubTransporter
+        {
+            OnAppendEntries = (_, req, _) => Task.FromResult(follower.HandleAppendEntries(req))
+        };
+        var leader = LeaderNode(transport, 1, Entry(1, 1), Entry(2, 1), Entry(3, 1));
+        leader.Info.CommitIndex = 3;
+
+        // Каждый отказ откатывает NextIndex на 1: 4 -> 3 -> 2 -> 1, затем успех.
+        for (var i = 0; i < 4; i++)
+            await leader.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal([1L, 2L, 3L], follower.Info.LogEntries.Select(e => e.LogIndex));
+        Assert.Equal(3L, leader.Info.MatchIndex[Peer]);
+        Assert.Equal(4L, leader.Info.NextIndex[Peer]);
+        Assert.Equal(3L, follower.Info.CommitIndex);
+        Assert.Equal("node1", follower.Info.LeaderId);
+    }
+
+    [Fact]
+    public async Task FollowerWithConflictingTail_IsOverwrittenByLeader()
+    {
+        var follower = CreateNode("node2", ["node1", "node3"], new StubTransporter());
+        follower.Info.CurrentTerm = 1;
+        follower.Info.LogEntries.AddRange([Entry(1, 1), Entry(2, 1), Entry(3, 1)]); // 2 и 3 от старого лидера
+
+        var transport = new StubTransporter
+        {
+            OnAppendEntries = (_, req, _) => Task.FromResult(follower.HandleAppendEntries(req))
+        };
+        var leader = LeaderNode(transport, 2, Entry(1, 1), Entry(2, 2), Entry(3, 2));
+
+        for (var i = 0; i < 4; i++)
+            await leader.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal([1UL, 2UL, 2UL], follower.Info.LogEntries.Select(e => e.Term));
+        Assert.Equal(3L, leader.Info.MatchIndex[Peer]);
     }
 }
