@@ -4,7 +4,6 @@ using NeoCask.Raft.Enums;
 using NeoCask.Raft.Interfaces;
 using static NeoCask.Raft.Tests.TestHelpers;
 
-
 namespace NeoCask.Raft.Tests;
 
 public class StubTransporter : INeoCaskRaftTransporter
@@ -198,6 +197,310 @@ public class HandleRequestVoteTests
 
         Assert.True(resp.IsVoted);
     }
+}
+
+public class RaftHelpersTests
+{
+    private static StubTransporter Responding(Func<AppendEntriesReq, AppendEntriesResp> respond)
+        => new() { OnAppendEntries = (_, req, _) => Task.FromResult(respond(req)) };
+
+
+    private static StubTransporter AlwaysSuccess()
+        => Responding(req => new AppendEntriesResp(req.Term, true));
+
+
+    private static NeoCaskRaftNode LeaderNode(StubTransporter transport, ulong term, params LogEntry[] log)
+    {
+        var node = CreateNode("node1", ["node2", "node3"], transport);
+        node.Info.CurrentTerm = term;
+        node.Info.Role = RaftRole.Leader;
+        node.Info.LeaderId = "node1";
+        node.Info.LogEntries.AddRange(log);
+
+        var next = (log.LastOrDefault()?.LogIndex ?? 0) + 1;
+        foreach (var peer in new[] { "node2", "node3" })
+        {
+            node.Info.NextIndex[peer] = next;
+            node.Info.MatchIndex[peer] = 0;
+        }
+
+        return node;
+    }
+
+
+    [Fact]
+    public void FindLogEntry_EmptyLog_ReturnsNull()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 1);
+
+        var entry = node.Info.FindLogEntry(1);
+
+        Assert.Null(entry);
+    }
+
+    [Fact]
+    public void FindLogEntry_ZeroOrNegativeIndex_ReturnsNull()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 1, Entry(1, 1), Entry(2, 1));
+
+        Assert.Null(node.Info.FindLogEntry(0));
+        Assert.Null(node.Info.FindLogEntry(-5));
+    }
+
+    [Fact]
+    public void FindLogEntry_IndexAboveLast_ReturnsNull()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 1, Entry(1, 1), Entry(2, 1));
+
+        var entry = node.Info.FindLogEntry(3);
+
+        Assert.Null(entry);
+    }
+
+    [Fact]
+    public void FindLogEntry_ExistingEntries_ReturnsCorrectEntry()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 2,
+            Entry(1, 1), Entry(2, 1), Entry(3, 2));
+
+        var first = node.Info.FindLogEntry(1);
+        var middle = node.Info.FindLogEntry(2);
+        var last = node.Info.FindLogEntry(3);
+
+        Assert.NotNull(first);
+        Assert.Equal(1L, first.LogIndex);
+        Assert.Equal(1UL, first.Term);
+
+        Assert.NotNull(middle);
+        Assert.Equal(2L, middle.LogIndex);
+        Assert.Equal(1UL, middle.Term);
+
+        Assert.NotNull(last);
+        Assert.Equal(3L, last.LogIndex);
+        Assert.Equal(2UL, last.Term);
+    }
+
+    [Fact]
+    public void FindLogEntry_AfterLogCompaction_ResolvesOffsetCorrectly()
+    {
+        // Имитируем усечение лога (снэпшот до 10-го индекса), лог начинается с 11
+        var node = LeaderNode(AlwaysSuccess(), 3,
+            Entry(11, 2), Entry(12, 3), Entry(13, 3));
+
+        var entry = node.Info.FindLogEntry(12);
+
+        Assert.NotNull(entry);
+        Assert.Equal(12L, entry.LogIndex);
+        Assert.Equal(3UL, entry.Term);
+    }
+
+    [Fact]
+    public void FindLogEntry_AfterLogCompaction_IndexBeforeFirst_ReturnsNull()
+    {
+        // Записи с 1 по 10 уже удалены снэпшотом
+        var node = LeaderNode(AlwaysSuccess(), 3,
+            Entry(11, 2), Entry(12, 3));
+
+        Assert.Null(node.Info.FindLogEntry(10));
+        Assert.Null(node.Info.FindLogEntry(1));
+    }
+}
+
+public class DetermineLatestCommitTests
+{
+    // Индексы от from до to включительно. Нужен, чтобы текущий терм шёл подряд до конца журнала.
+    private static long[] Indexes(long from, long to)
+        => Enumerable.Range((int)from, (int)(to - from + 1)).Select(i => (long)i).ToArray();
+
+    // Журнал 1..lastIndex. У индексов из currentTermIndexes терм currentTerm, у остальных previousTerm.
+    private static void AddLogEntries(
+        NeoCaskRaftNode node,
+        long lastIndex,
+        ulong previousTerm,
+        ulong currentTerm,
+        params long[] currentTermIndexes)
+    {
+        var currentTermSet = currentTermIndexes.ToHashSet();
+
+        for (var index = 1L; index <= lastIndex; index++)
+        {
+            var term = currentTermSet.Contains(index) ? currentTerm : previousTerm;
+            node.Info.LogEntries.Add(Entry(index, term));
+        }
+    }
+
+    [Fact]
+    public void ShouldCommitHighestCurrentTermIndexReplicatedOnMajority()
+    {
+        // 5 узлов, большинство 3. Индекс 9 у лидера и ещё двух, индекс 10 только у двух.
+        var node = CreateNode(3, 0, 12, 10, 9, 7, 3);
+        AddLogEntries(node, 12, 2, 3, Indexes(9, 12));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(9, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void ShouldNotCommitEntryFromPreviousTermWithoutCurrentTermEntry()
+    {
+        // Индексы до 9 на большинстве, но терм старый. Запись текущего терма (10) только у двух узлов.
+        var node = CreateNode(3, 2, 12, 10, 9, 7, 3);
+        AddLogEntries(node, 12, 2, 3, Indexes(10, 12));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(2, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void ShouldCommitPreviousTermEntriesTogetherWithCurrentTermEntry()
+    {
+        // Записи 8 и 9 старого терма сами не коммитятся. Запись 10 текущего терма лежит на трёх узлах,
+        // и вместе с ней коммитится всё, что перед ней.
+        var node = CreateNode(3, 0, 12, 10, 10, 7, 3);
+        AddLogEntries(node, 12, 2, 3, Indexes(10, 12));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(10, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void ShouldNotCommitCurrentTermEntryReplicatedOnlyOnMinority()
+    {
+        // Индекс 4 (текущий терм) у двух узлов. Индекс 3 у трёх, но терм старый.
+        var node = CreateNode(3, 2, 12, 10, 3, 2, 1);
+        AddLogEntries(node, 12, 2, 3, Indexes(4, 12));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(2, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void ShouldUseCorrectMajorityForEvenNumberOfNodes()
+    {
+        // 4 узла, большинство 3. Индекс 20 у лидера и ещё двух, индекс 21 только у двух.
+        var node = CreateNode(3, 0, 100, 50, 20, 10);
+        AddLogEntries(node, 100, 2, 3, Indexes(20, 100));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(20, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void ShouldCommitEntryOnSingleNodeCluster()
+    {
+        var node = CreateNode(3, 0, 5);
+        AddLogEntries(node, 5, 2, 3, Indexes(5, 5));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(5, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void EmptyLog_DoesNotThrow_AndCommitsNothing()
+    {
+        var node = CreateNode(3, 0, 0, 0, 0); // журнал не заполняем
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(0, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void ShouldCountLeaderItself()
+    {
+        // 3 узла, большинство 2. Лидер и node-1 имеют индекс 5, node-2 отстаёт.
+        // Если лидера не считать, подтверждений будет 1, и коммит останется 0.
+        var node = CreateNode(3, 0, 5, 5, 3);
+        AddLogEntries(node, 5, 2, 3, Indexes(1, 5));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(5, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void ShouldNotCommitWhenOnlyLeaderHasEntry()
+    {
+        // 3 узла, пиры ничего не подтвердили. Один лидер это 1 из 3.
+        var node = CreateNode(3, 0, 5, 0, 0);
+        AddLogEntries(node, 5, 2, 3, Indexes(1, 5));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(0, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void ShouldAdvanceCommitIndexFromExistingValue()
+    {
+        var node = CreateNode(3, 4, 12, 10, 9, 7, 3);
+        AddLogEntries(node, 12, 2, 3, Indexes(9, 12));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(9, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void ShouldNeverDecreaseCommitIndex()
+    {
+        // Пиры «откатились» ниже уже закоммиченного. CommitIndex должен остаться 10.
+        var node = CreateNode(3, 10, 12, 5, 4, 3, 2);
+        AddLogEntries(node, 12, 2, 3, Indexes(1, 12));
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(10, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public void NonLeader_DoesNotCommit()
+    {
+        var node = CreateNode(3, 0, 12, 10, 9, 7, 3);
+        AddLogEntries(node, 12, 2, 3, Indexes(1, 12));
+        node.Info.Role = RaftRole.Follower;
+
+        node.DetermineLatestCommit();
+
+        Assert.Equal(0, node.Info.CommitIndex);
+    }
+
+    // matchIndexes[0] это последний индекс самого лидера. В MatchIndex он не попадает, как и в боевом коде.
+    // Остальные значения это пиры.
+    private static NeoCaskRaftNode CreateNode(
+        ulong currentTerm,
+        long commitIndex,
+        params long[] matchIndexes)
+    {
+        var nodeIds = Enumerable.Range(0, matchIndexes.Length)
+            .Select(index => $"node-{index}")
+            .ToArray();
+
+        var clusterConfig = new NeoCaskRaftClusterConfig(
+            nodeIds[0],
+            [.. nodeIds.Skip(1)]);
+
+        var node = new NeoCaskRaftNode(clusterConfig, null!);
+
+        node.Info.Role = RaftRole.Leader;
+        node.Info.CurrentTerm = currentTerm;
+        node.Info.CommitIndex = commitIndex;
+
+        for (var i = 1; i < nodeIds.Length; i++)
+        {
+            node.Info.MatchIndex.Add(nodeIds[i], matchIndexes[i]);
+        }
+
+        return node;
+    }
+
+    // AddLogEntries без изменений, остаётся твой.
 }
 
 public class StartElectionTests
@@ -1025,5 +1328,63 @@ public class ReplicateToPeerTests
 
         Assert.Equal([1UL, 2UL, 2UL], follower.Info.LogEntries.Select(e => e.Term));
         Assert.Equal(3L, leader.Info.MatchIndex[Peer]);
+    }
+
+    [Fact]
+    public async Task Success_AdvancesLeaderCommitIndex_WhenMajorityReached()
+    {
+        // 3 узла, большинство 2: лидер + node2 имеют записи 1-2
+        var node = LeaderNode(AlwaysSuccess(), 1, Entry(1, 1), Entry(2, 1));
+        node.Info.NextIndex[Peer] = 1;
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(2L, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public async Task Success_DoesNotCommitEntriesFromOldTerm()
+    {
+        // записи терма 1, лидер уже в терме 2: сами они не коммитятся
+        var node = LeaderNode(AlwaysSuccess(), 2, Entry(1, 1), Entry(2, 1));
+        node.Info.NextIndex[Peer] = 1;
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(2L, node.Info.MatchIndex[Peer]);
+        Assert.Equal(0L, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public async Task Reject_DoesNotChangeCommitIndex()
+    {
+        var node = LeaderNode(AlwaysReject(), 1, Entry(1, 1), Entry(2, 1));
+        node.Info.MatchIndex[Peer] = 2;
+
+        await node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+
+        Assert.Equal(0L, node.Info.CommitIndex);
+    }
+
+    [Fact]
+    public async Task LateSuccess_DoesNotLowerMatchIndex()
+    {
+        // Запрос ушёл с записями 1-2. Пока ждали ответ, другой ответ уже поднял MatchIndex до 4.
+        var pending = new TaskCompletionSource<AppendEntriesResp>();
+        var transport = new StubTransporter { OnAppendEntries = (_, _, _) => pending.Task };
+        var node = LeaderNode(transport, 1, Entry(1, 1), Entry(2, 1));
+        node.Info.NextIndex[Peer] = 1;
+
+        var replication = node.ReplicateToPeerAsync(Peer, CancellationToken.None);
+        Assert.False(replication.IsCompleted);
+
+        node.Info.LogEntries.AddRange([Entry(3, 1), Entry(4, 1)]);
+        node.Info.MatchIndex[Peer] = 4;
+        node.Info.NextIndex[Peer] = 5;
+        pending.SetResult(new AppendEntriesResp(1, true));
+        await replication;
+
+        Assert.Equal(4L, node.Info.MatchIndex[Peer]);
+        Assert.Equal(5L, node.Info.NextIndex[Peer]);
     }
 }

@@ -62,4 +62,40 @@ public class NeoCaskRaftInfo
     /// For each follower, the highest log index known to be replicated on that follower.
     /// </summary>
     public Dictionary<string, long> MatchIndex { get; } = new();
+
+    public bool IsIndexInCurrentTerm(long targetLogIndex)
+    {
+        if (LogEntries.Count == 0)
+        {
+            return false;
+        }
+
+        return LogEntries.Where(x => x.LogIndex == targetLogIndex)
+            .Select(x => x.Term == CurrentTerm)
+            .FirstOrDefault();
+    }
+
+    public LogEntry? FindLogEntry(long targetLogIndex)
+    {
+        if (LogEntries.Count == 0)
+        {
+            return null;
+        }
+
+        var lastElementInLogEntries = LogEntries[^1].LogIndex;
+        if (lastElementInLogEntries < targetLogIndex)
+        {
+            return null;
+        }
+
+        var firstElement = LogEntries[0].LogIndex;
+        var offset = targetLogIndex - firstElement;
+
+        if (offset >= 0 && offset <= LogEntries.Count)
+        {
+            return LogEntries[(int)offset];
+        }
+
+        return null;
+    }
 }

@@ -10,7 +10,7 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
     private readonly INeoCaskRaftTransporter _transporter;
 
     private readonly IReadOnlyList<string> _peers;
-    private readonly object _lock = new();
+    private readonly Lock _lock = new();
 
     public NeoCaskRaftInfo Info => _raftInfo;
 
@@ -162,6 +162,33 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
         }
     }
 
+    public void DetermineLatestCommit()
+    {
+        lock (_lock)
+        {
+            if (_raftInfo.Role != RaftRole.Leader)
+            {
+                return;
+            }
+
+            var startingCommitIndex = _raftInfo.CommitIndex + 1;
+            var maxIndex = _raftInfo.LogEntries.LastOrDefault()?.LogIndex ?? 0;
+
+            var currentIndexToCommit = _raftInfo.CommitIndex;
+
+            for (var index = startingCommitIndex; index <= maxIndex; index++)
+            {
+                var longs = _raftInfo.MatchIndex.Values.Count(indexes => indexes >= index) + 1;
+                if (_raftInfo.IsIndexInCurrentTerm(index) && IsMajority(longs))
+                {
+                    currentIndexToCommit = index;
+                }
+            }
+
+            _raftInfo.CommitIndex = currentIndexToCommit;
+        }
+    }
+
     public async Task ReplicateToPeerAsync(string peer, CancellationToken cancellationToken)
     {
         long prevLogIndex;
@@ -228,9 +255,10 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
                 }
                 case true:
                 {
-                    var entriesCount = prevLogIndex + req.Entries.Count;
-                    _raftInfo.MatchIndex[peer] = entriesCount;
-                    _raftInfo.NextIndex[peer] = entriesCount + 1;
+                    var matchIndex = prevLogIndex + req.Entries.Count;
+                    _raftInfo.MatchIndex[peer] = Math.Max(_raftInfo.MatchIndex[peer], matchIndex);
+                    _raftInfo.NextIndex[peer] = Math.Max(_raftInfo.NextIndex[peer], matchIndex + 1);
+                    DetermineLatestCommit();
                     break;
                 }
             }
@@ -324,6 +352,10 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
             }
         }
     }
+
+    private int GetMajorityCount => (_peers.Count + 1) / 2 + 1;
+
+    private bool IsMajority(int count) => GetMajorityCount <= count;
 
     public void Dispose()
     {
