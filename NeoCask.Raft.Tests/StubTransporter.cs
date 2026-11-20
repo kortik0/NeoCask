@@ -304,6 +304,38 @@ public class RaftHelpersTests
         Assert.Null(node.Info.FindLogEntry(10));
         Assert.Null(node.Info.FindLogEntry(1));
     }
+
+    [Fact]
+    public void IsIndexInCurrentTerm_EmptyLog_ReturnsFalse()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 1);
+
+        Assert.False(node.Info.IsIndexInCurrentTerm(1));
+    }
+
+    [Fact]
+    public void IsIndexInCurrentTerm_IndexAboveLast_ReturnsFalse()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 1, Entry(1, 1), Entry(2, 1));
+
+        Assert.False(node.Info.IsIndexInCurrentTerm(3));
+    }
+
+    [Fact]
+    public void IsIndexInCurrentTerm_EntryFromCurrentTerm_ReturnsTrue()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 2, Entry(1, 1), Entry(2, 2));
+
+        Assert.True(node.Info.IsIndexInCurrentTerm(2));
+    }
+
+    [Fact]
+    public void IsIndexInCurrentTerm_EntryFromOldTerm_ReturnsFalse()
+    {
+        var node = LeaderNode(AlwaysSuccess(), 2, Entry(1, 1), Entry(2, 2));
+
+        Assert.False(node.Info.IsIndexInCurrentTerm(1));
+    }
 }
 
 public class DetermineLatestCommitTests
