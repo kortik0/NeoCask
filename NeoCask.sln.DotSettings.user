@@ -52,6 +52,9 @@
     &lt;ProjectFile&gt;84E7FE97-BC3D-4B6F-9841-07A551385D74/f:StubTransporter.cs&lt;/ProjectFile&gt;&#xD;
   &lt;/Or&gt;&#xD;
 &lt;/SessionState&gt;</s:String>
+	<s:String x:Key="/Default/Environment/UnitTesting/UnitTestSessionStore/Sessions/=eb7bb7f4_002Db3b6_002D44c2_002D88e1_002D48454256edd7/@EntryIndexedValue">&lt;SessionState ContinuousTestingMode="0" IsActive="True" Name="All tests from &amp;lt;RaftCluster&amp;gt;" xmlns="urn:schemas-jetbrains-com:jetbrains-ut-session"&gt;&#xD;
+  &lt;Project Location="F:\Sharp\tests_projects\NeoCask" Presentation="&amp;lt;RaftCluster&amp;gt;" /&gt;&#xD;
+&lt;/SessionState&gt;</s:String>
 	
 	
 	

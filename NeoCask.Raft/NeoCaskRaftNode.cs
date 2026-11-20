@@ -353,6 +353,24 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
         }
     }
 
+    public async Task ReplicateToAllPeersAsync(CancellationToken cancellationToken)
+    {
+        var tasks = _peers.Select(async peer =>
+        {
+            try
+            {
+                await ReplicateToPeerAsync(peer, cancellationToken);
+                return true;
+            }
+            catch (Exception e)
+            {
+                return false;
+            }
+        });
+
+        await Task.WhenAll(tasks);
+    }
+
     private int GetMajorityCount => (_peers.Count + 1) / 2 + 1;
 
     private bool IsMajority(int count) => GetMajorityCount <= count;

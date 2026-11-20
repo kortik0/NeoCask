@@ -1013,6 +1013,69 @@ public class ReplicateToPeerTests
 {
     private const string Peer = "node2";
 
+    [Fact]
+    public async Task ReplicateToAll_SendsToEveryPeer()
+    {
+        var transport = AlwaysSuccess();
+        var node = LeaderNode(transport, 1, Entry(1, 1));
+
+        await node.ReplicateToAllPeersAsync(CancellationToken.None);
+
+        Assert.Equal(["node2", "node3"], transport.SentAppends.Select(x => x.Target).Order());
+    }
+
+    [Fact]
+    public async Task ReplicateToAll_NotLeader_SendsNothing()
+    {
+        var transport = AlwaysSuccess();
+        var node = LeaderNode(transport, 1, Entry(1, 1));
+        node.Info.Role = RaftRole.Follower;
+
+        await node.ReplicateToAllPeersAsync(CancellationToken.None);
+
+        Assert.Empty(transport.SentAppends);
+    }
+
+    [Fact]
+    public async Task ReplicateToAll_OnePeerDown_OtherPeerStillUpdated()
+    {
+        var transport = new StubTransporter
+        {
+            OnAppendEntries = (target, req, _) => target == "node2"
+                ? Task.FromException<AppendEntriesResp>(new HttpRequestException("down"))
+                : Task.FromResult(new AppendEntriesResp(req.Term, true))
+        };
+        var node = LeaderNode(transport, 1, Entry(1, 1));
+
+        await node.ReplicateToAllPeersAsync(CancellationToken.None);
+
+        Assert.Equal(0L, node.Info.MatchIndex["node2"]);
+        Assert.Equal(1L, node.Info.MatchIndex["node3"]);
+        Assert.Equal(1L, node.Info.CommitIndex); // лидер + node3 = 2 из 3
+    }
+
+    [Fact]
+    public async Task ReplicateToAll_HangingPeer_DoesNotBlockOthers()
+    {
+        var hanging = new TaskCompletionSource<AppendEntriesResp>();
+        var transport = new StubTransporter
+        {
+            OnAppendEntries = (target, req, _) => target == "node2"
+                ? hanging.Task
+                : Task.FromResult(new AppendEntriesResp(req.Term, true))
+        };
+        var node = LeaderNode(transport, 1, Entry(1, 1));
+
+        var round = node.ReplicateToAllPeersAsync(CancellationToken.None);
+
+        Assert.False(round.IsCompleted); // node2 ещё не ответил
+        Assert.Equal(1L, node.Info.MatchIndex["node3"]); // а node3 уже обработан
+
+        hanging.SetResult(new AppendEntriesResp(1, true));
+        await round;
+        Assert.Equal(1L, node.Info.MatchIndex["node2"]);
+    }
+
     /// Лидер node1 в терме `term`. NextIndex пиров = последний индекс + 1, MatchIndex = 0.
     private static NeoCaskRaftNode LeaderNode(StubTransporter transport, ulong term, params LogEntry[] log)
     {
