@@ -707,6 +707,66 @@ public class StartElectionTests
         Assert.Equal(2UL, node1.Info.CurrentTerm);
         Assert.Equal(RaftRole.Candidate, node1.Info.Role);
     }
+
+    [Fact]
+    public async Task ElectionTimeout_Leader_DoesNothing()
+    {
+        var (nodes, transport) = CreateCluster();
+        transport.OnAppendEntries = (_, req, _) => Task.FromResult(new AppendEntriesResp(req.Term, true));
+        var node1 = nodes["node1"];
+        node1.Info.Role = RaftRole.Leader;
+        node1.Info.CurrentTerm = 1;
+        node1.Info.NextIndex["node2"] = 1;
+        node1.Info.NextIndex["node3"] = 1;
+        node1.Info.MatchIndex["node2"] = 0;
+        node1.Info.MatchIndex["node3"] = 0;
+
+        await node1.ElectionTimeoutAsync(CancellationToken.None);
+
+        Assert.Empty(transport.SentVotes);
+        Assert.Equal(1UL, node1.Info.CurrentTerm);
+    }
+
+    [Fact]
+    public async Task ElectionTimeout_Follower_WinsAndSendsFirstHeartbeatImmediately()
+    {
+        var (nodes, transport) = CreateCluster();
+        transport.OnAppendEntries = (_, req, _) => Task.FromResult(new AppendEntriesResp(req.Term, true));
+        var node1 = nodes["node1"];
+
+        await node1.ElectionTimeoutAsync(CancellationToken.None);
+
+        Assert.Equal(RaftRole.Leader, node1.Info.Role);
+        Assert.Equal(["node2", "node3"], transport.SentAppends.Select(x => x.Target).Order());
+        Assert.All(transport.SentAppends, x => Assert.Equal(1UL, x.Request.Term));
+    }
+
+    [Fact]
+    public async Task ElectionTimeout_Follower_Loses_SendsNoHeartbeat()
+    {
+        var (nodes, transport) = CreateCluster();
+        transport.OnRequestVote = StubTransporter.Route(nodes, down: ["node2", "node3"]);
+        transport.OnAppendEntries = (_, req, _) => Task.FromResult(new AppendEntriesResp(req.Term, true));
+        var node1 = nodes["node1"];
+
+        await node1.ElectionTimeoutAsync(CancellationToken.None);
+
+        Assert.Equal(RaftRole.Candidate, node1.Info.Role);
+        Assert.Empty(transport.SentAppends);
+    }
+
+    [Fact]
+    public async Task ElectionTimeout_Candidate_StartsNewRoundWithNextTerm()
+    {
+        var (nodes, transport) = CreateCluster();
+        transport.OnRequestVote = StubTransporter.Route(nodes, down: ["node2", "node3"]);
+        var node1 = nodes["node1"];
+
+        await node1.ElectionTimeoutAsync(CancellationToken.None);
+        await node1.ElectionTimeoutAsync(CancellationToken.None);
+
+        Assert.Equal(2UL, node1.Info.CurrentTerm);
+    }
 }
 
 public class HandleAppendEntriesTests

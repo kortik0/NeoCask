@@ -265,6 +265,29 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
         }
     }
 
+    public async Task ElectionTimeoutAsync(CancellationToken cancellationToken)
+    {
+        lock (_lock)
+        {
+            if (_raftInfo.Role == RaftRole.Leader)
+            {
+                return;
+            }
+        }
+
+        await StartElectionAsync(cancellationToken);
+
+        lock (_lock)
+        {
+            if (_raftInfo.Role != RaftRole.Leader)
+            {
+                return;
+            }
+        }
+
+        await ReplicateToAllPeersAsync(cancellationToken);
+    }
+
     public async Task StartElectionAsync(CancellationToken cancellationToken)
     {
         ulong startedTerm;
