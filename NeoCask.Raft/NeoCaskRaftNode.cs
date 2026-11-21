@@ -9,17 +9,21 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
     private readonly NeoCaskRaftInfo _raftInfo;
     private readonly INeoCaskRaftTransporter _transporter;
 
+    private readonly TimeProvider? _timeProvider;
+    private readonly NeoCaskTimerConfiguration? _timerConfiguration;
+
     private readonly IReadOnlyList<string> _peers;
     private readonly Lock _lock = new();
 
     public NeoCaskRaftInfo Info => _raftInfo;
 
-    private Timer? _heartbeatTimer;
-    private Timer? _electionTimer;
+    private ITimer? _heartbeatTimer;
+    private ITimer? _electionTimer;
 
     private CancellationTokenSource _cancellationTokenSource;
 
-    public NeoCaskRaftNode(NeoCaskRaftClusterConfig clusterConfig, INeoCaskRaftTransporter transporter)
+    public NeoCaskRaftNode(NeoCaskRaftClusterConfig clusterConfig, INeoCaskRaftTransporter transporter,
+        TimeProvider? timeProvider = null, NeoCaskTimerConfiguration? timerConfiguration = null)
     {
         _raftInfo = new NeoCaskRaftInfo()
         {
@@ -27,6 +31,18 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
         };
         _peers = [.. clusterConfig.PeersIds];
         _transporter = transporter;
+
+        _timeProvider = timeProvider switch
+        {
+            null => TimeProvider.System,
+            _ => timeProvider
+        };
+
+        _timerConfiguration = timerConfiguration switch
+        {
+            null => new NeoCaskTimerConfiguration(),
+            _ => timerConfiguration
+        };
     }
 
     public void Start()
@@ -34,8 +50,39 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
         lock (_lock)
         {
             _cancellationTokenSource = new CancellationTokenSource();
-            // _electionTimer = new Timer()
+            _electionTimer =
+                _timeProvider?.CreateTimer(ElectionTimerCallback,
+                    null, GetElectionTime(), Timeout.InfiniteTimeSpan);
         }
+    }
+
+    private async void ElectionTimerCallback(object? _)
+    {
+        try
+        {
+            await ElectionTimeoutAsync(_cancellationTokenSource.Token);
+        }
+        catch (Exception e)
+        {
+            return;
+        }
+        finally
+        {
+            ResetElectionTimer();
+        }
+    }
+
+    public void ResetElectionTimer()
+    {
+        _electionTimer?.Change(GetElectionTime(), Timeout.InfiniteTimeSpan);
+    }
+
+    private TimeSpan GetElectionTime()
+    {
+        var interval =
+            Random.Shared.NextInt64(_timerConfiguration.MinElectionTime, _timerConfiguration.MaxElectionTime + 1);
+
+        return TimeSpan.FromMilliseconds(interval);
     }
 
     // TODO: Should be simplified later
@@ -70,6 +117,8 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
             {
                 _raftInfo.VotedFor = requestVoteReq.CandidateId;
                 resp = new RequestVoteResp(_raftInfo.CurrentTerm, true);
+                ResetElectionTimer();
+
                 return resp;
             }
 
@@ -88,6 +137,8 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
                 {
                     _raftInfo.VotedFor = requestVoteReq.CandidateId;
                     resp = new RequestVoteResp(_raftInfo.CurrentTerm, true);
+                    ResetElectionTimer();
+
                     return resp;
                 }
 
@@ -100,6 +151,7 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
 
             _raftInfo.VotedFor = requestVoteReq.CandidateId;
             resp = new RequestVoteResp(_raftInfo.CurrentTerm, true);
+            ResetElectionTimer();
             return resp;
         }
     }
@@ -112,6 +164,9 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
             {
                 return new AppendEntriesResp(_raftInfo.CurrentTerm, false);
             }
+
+            ResetElectionTimer();
+
 
             if (req.Term > _raftInfo.CurrentTerm)
             {

@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using Microsoft.Extensions.Time.Testing;
 using NeoCask.Raft.DTO;
 using NeoCask.Raft.Enums;
 using NeoCask.Raft.Interfaces;
@@ -1541,5 +1542,138 @@ public class ReplicateToPeerTests
 
         Assert.Equal(4L, node.Info.MatchIndex[Peer]);
         Assert.Equal(5L, node.Info.NextIndex[Peer]);
+    }
+
+    public class ElectionTimerTests
+    {
+        private static (NeoCaskRaftNode Node, StubTransporter Transport, FakeTimeProvider Time) Create()
+        {
+            var time = new FakeTimeProvider();
+            var transport = new StubTransporter
+            {
+                OnRequestVote = (_, req, _) => Task.FromResult(new RequestVoteResp(req.Term, false))
+            };
+            var node = new NeoCaskRaftNode(
+                new NeoCaskRaftClusterConfig("node1", ["node2", "node3"]), transport, time);
+            node.Start();
+            return (node, transport, time);
+        }
+
+        private static AppendEntriesReq Heartbeat(ulong term)
+            => new(term, "node2", 0, 0, new List<LogEntry>(), 0);
+
+        [Fact]
+        public void BeforeMinTimeout_NoElection()
+        {
+            var (node, transport, time) = Create();
+            using var _ = node;
+
+            time.Advance(TimeSpan.FromMilliseconds(299));
+
+            Assert.Empty(transport.SentVotes);
+        }
+
+        [Fact]
+        public void AfterMaxTimeout_StartsElection()
+        {
+            var (node, transport, time) = Create();
+            using var _ = node;
+
+            time.Advance(TimeSpan.FromMilliseconds(701));
+
+            Assert.Equal(["node2", "node3"], transport.SentVotes.Select(x => x.Target).Order());
+            Assert.Equal(RaftRole.Candidate, node.Info.Role);
+        }
+
+        [Fact]
+        public void FailedElection_IsRetriedWithNextTerm()
+        {
+            var (node, _, time) = Create();
+            using var _ = node;
+
+            time.Advance(TimeSpan.FromMilliseconds(701));
+            time.Advance(TimeSpan.FromMilliseconds(701));
+
+            Assert.Equal(2UL, node.Info.CurrentTerm);
+        }
+
+        [Fact]
+        public void ValidAppendEntries_KeepsResettingTimer()
+        {
+            var (node, transport, time) = Create();
+            using var _ = node;
+
+            // 10 раз по 290 мс (меньше минимума 300). Без сброса таймер сработал бы не позже 700 мс.
+            for (var i = 0; i < 10; i++)
+            {
+                time.Advance(TimeSpan.FromMilliseconds(290));
+                node.HandleAppendEntries(Heartbeat(1));
+            }
+
+            Assert.Empty(transport.SentVotes);
+        }
+
+        [Fact]
+        public void StaleAppendEntries_DoesNotResetTimer()
+        {
+            var (node, transport, time) = Create();
+            using var _ = node;
+            node.Info.CurrentTerm = 1;
+
+            time.Advance(TimeSpan.FromMilliseconds(290));
+            node.HandleAppendEntries(Heartbeat(0)); // терм 0 < 1, устаревший
+            time.Advance(TimeSpan.FromMilliseconds(411)); // всего 701
+
+            Assert.NotEmpty(transport.SentVotes);
+        }
+
+        [Fact]
+        public void GrantedVote_KeepsResettingTimer()
+        {
+            var (node, transport, time) = Create();
+            using var _ = node;
+
+            for (var i = 0; i < 10; i++)
+            {
+                time.Advance(TimeSpan.FromMilliseconds(290));
+                Assert.True(node.HandleRequestVote(Vote(1, "node2")).IsVoted);
+            }
+
+            Assert.Empty(transport.SentVotes);
+        }
+
+        [Fact]
+        public void DeniedVote_DoesNotResetTimer()
+        {
+            var (node, transport, time) = Create();
+            using var _ = node;
+            Assert.True(node.HandleRequestVote(Vote(1, "node2")).IsVoted); // сброс в момент 0
+
+            time.Advance(TimeSpan.FromMilliseconds(290));
+            Assert.False(node.HandleRequestVote(Vote(1, "node3")).IsVoted); // отказ, сброса нет
+            time.Advance(TimeSpan.FromMilliseconds(411));
+
+            Assert.NotEmpty(transport.SentVotes);
+        }
+
+        [Fact]
+        public void CustomTimerConfiguration_IsUsed()
+        {
+            var time = new FakeTimeProvider();
+            var transport = new StubTransporter
+            {
+                OnRequestVote = (_, req, _) => Task.FromResult(new RequestVoteResp(req.Term, false))
+            };
+            var config = new NeoCaskTimerConfiguration { MinElectionTime = 1000, MaxElectionTime = 1000 };
+            using var node = new NeoCaskRaftNode(
+                new NeoCaskRaftClusterConfig("node1", ["node2", "node3"]), transport, time, config);
+            node.Start();
+
+            time.Advance(TimeSpan.FromMilliseconds(999));
+            Assert.Empty(transport.SentVotes);
+
+            time.Advance(TimeSpan.FromMilliseconds(1));
+            Assert.NotEmpty(transport.SentVotes);
+        }
     }
 }
