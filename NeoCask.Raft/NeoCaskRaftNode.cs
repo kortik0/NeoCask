@@ -49,10 +49,34 @@ public class NeoCaskRaftNode : IDisposable, IAsyncDisposable
     {
         lock (_lock)
         {
+            TimeSpan heartbeatTimeSpan = TimeSpan.FromMilliseconds(_timerConfiguration.LeaderHeartbeatTime);
+
             _cancellationTokenSource = new CancellationTokenSource();
             _electionTimer =
                 _timeProvider?.CreateTimer(ElectionTimerCallback,
                     null, GetElectionTime(), Timeout.InfiniteTimeSpan);
+            _heartbeatTimer = _timeProvider.CreateTimer(HeartbeatTimerCallback, null,
+                heartbeatTimeSpan, heartbeatTimeSpan);
+        }
+    }
+
+    private async void HeartbeatTimerCallback(object? o)
+    {
+        lock (_lock)
+        {
+            if (_raftInfo.Role != RaftRole.Leader)
+            {
+                return;
+            }
+        }
+
+        try
+        {
+            await ReplicateToAllPeersAsync(_cancellationTokenSource.Token);
+        }
+        catch (Exception e)
+        {
+            return;
         }
     }
 

@@ -1676,4 +1676,92 @@ public class ReplicateToPeerTests
             Assert.NotEmpty(transport.SentVotes);
         }
     }
+
+    public class HeartbeatTimerTests
+    {
+        private static (NeoCaskRaftNode Node, StubTransporter Transport, FakeTimeProvider Time) Create(bool leader)
+        {
+            var time = new FakeTimeProvider();
+            var transport = new StubTransporter
+            {
+                OnRequestVote = (_, req, _) => Task.FromResult(new RequestVoteResp(req.Term, false)),
+                OnAppendEntries = (_, req, _) => Task.FromResult(new AppendEntriesResp(req.Term, true))
+            };
+            var node = new NeoCaskRaftNode(
+                new NeoCaskRaftClusterConfig("node1", ["node2", "node3"]), transport, time);
+
+            if (leader)
+            {
+                node.Info.CurrentTerm = 1;
+                node.Info.Role = RaftRole.Leader;
+                node.Info.LeaderId = "node1";
+                foreach (var peer in new[] { "node2", "node3" })
+                {
+                    node.Info.NextIndex[peer] = 1;
+                    node.Info.MatchIndex[peer] = 0;
+                }
+            }
+
+            node.Start();
+            return (node, transport, time);
+        }
+
+        [Fact]
+        public void Leader_SendsHeartbeatToAllPeersEvery100ms()
+        {
+            var (node, transport, time) = Create(leader: true);
+            using var _ = node;
+
+            time.Advance(TimeSpan.FromMilliseconds(99));
+            Assert.Empty(transport.SentAppends);
+
+            time.Advance(TimeSpan.FromMilliseconds(1));
+            Assert.Equal(["node2", "node3"], transport.SentAppends.Select(x => x.Target).Order());
+
+            time.Advance(TimeSpan.FromMilliseconds(100));
+            Assert.Equal(4, transport.SentAppends.Count);
+        }
+
+        [Fact]
+        public void Follower_SendsNoHeartbeats()
+        {
+            var (node, transport, time) = Create(leader: false);
+            using var _ = node;
+
+            time.Advance(TimeSpan.FromMilliseconds(100));
+            time.Advance(TimeSpan.FromMilliseconds(100)); // всего 200 мс, выборы ещё не начались
+
+            Assert.Empty(transport.SentAppends);
+        }
+
+        [Fact]
+        public void Leader_AfterStepDown_StopsSendingHeartbeats()
+        {
+            var (node, transport, time) = Create(leader: true);
+            using var _ = node;
+
+            time.Advance(TimeSpan.FromMilliseconds(100));
+            Assert.Equal(2, transport.SentAppends.Count);
+
+            node.HandleAppendEntries(new AppendEntriesReq(2, "node2", 0, 0, new List<LogEntry>(), 0));
+            time.Advance(TimeSpan.FromMilliseconds(100));
+
+            Assert.Equal(RaftRole.Follower, node.Info.Role);
+            Assert.Equal(2, transport.SentAppends.Count);
+        }
+
+        [Fact]
+        public void Leader_DoesNotStartElection()
+        {
+            var (node, transport, time) = Create(leader: true);
+            using var _ = node;
+
+            for (var i = 0; i < 20; i++) // 2 секунды, election timer успевает сработать
+                time.Advance(TimeSpan.FromMilliseconds(100));
+
+            Assert.Empty(transport.SentVotes);
+            Assert.Equal(1UL, node.Info.CurrentTerm);
+            Assert.Equal(RaftRole.Leader, node.Info.Role);
+        }
+    }
 }
